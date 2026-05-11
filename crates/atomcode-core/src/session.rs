@@ -231,6 +231,11 @@ impl SessionManager {
         }
     }
 
+    /// Return the stable project hash used as the session directory name.
+    pub fn project_hash(&self) -> &str {
+        &self.project_hash
+    }
+
     /// Get the directory for this project's sessions.
     fn project_dir(&self) -> PathBuf {
         self.sessions_dir.join(&self.project_hash)

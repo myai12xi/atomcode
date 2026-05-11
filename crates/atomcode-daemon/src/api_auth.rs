@@ -10,6 +10,8 @@ use atomcode_core::auth;
 
 use crate::{api_config::cleanup_expired_sessions, json_error, AppState, LoginSessionEntry};
 
+const AUTH_PROVIDER: &str = "atomgit";
+
 pub(crate) enum LoginPollStep {
     Pending,
     Authorized(auth::UserInfo),
@@ -28,8 +30,12 @@ enum BlockingLoginPollStep {
 struct AuthStatusResponse {
     logged_in: bool,
     auth_path: String,
+    provider: String,
+    account_id: Option<String>,
+    username: Option<String>,
     user: Option<auth::UserInfo>,
     token: Option<TokenInfo>,
+    capabilities: AuthCapabilities,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,7 +43,18 @@ struct TokenInfo {
     token_type: String,
     expires_in: Option<i64>,
     created_at: i64,
+    expires_at: Option<i64>,
+    token_expiring: bool,
     has_refresh_token: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthCapabilities {
+    oauth_login: bool,
+    token_refresh: bool,
+    codingplan: bool,
+    daemon_handoff: bool,
+    account_relay: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,27 +92,63 @@ pub(crate) async fn auth_status() -> impl IntoResponse {
     match auth::get_stored_auth() {
         Some(info) => {
             let has_refresh = info.refresh_token.is_some();
+            let expires_at = info.expires_in.and_then(|v| info.created_at.checked_add(v));
+            let now = current_unix_secs();
+            let token_expiring = match (expires_at, now) {
+                (Some(expires_at), Some(now)) => now >= expires_at.saturating_sub(300),
+                _ => false,
+            };
             Json(AuthStatusResponse {
                 logged_in: true,
                 auth_path: auth_path_str,
+                provider: AUTH_PROVIDER.to_string(),
+                account_id: Some(info.user.id.clone()),
+                username: Some(info.user.username.clone()),
                 user: Some(info.user),
                 token: Some(TokenInfo {
                     token_type: info.token_type,
                     expires_in: info.expires_in,
                     created_at: info.created_at,
+                    expires_at,
+                    token_expiring,
                     has_refresh_token: has_refresh,
                 }),
+                capabilities: AuthCapabilities {
+                    oauth_login: true,
+                    token_refresh: has_refresh,
+                    codingplan: true,
+                    daemon_handoff: true,
+                    // 暂未接入 relay。
+                    account_relay: false,
+                },
             })
             .into_response()
         }
         None => Json(AuthStatusResponse {
             logged_in: false,
             auth_path: auth_path_str,
+            provider: AUTH_PROVIDER.to_string(),
+            account_id: None,
+            username: None,
             user: None,
             token: None,
+            capabilities: AuthCapabilities {
+                oauth_login: true,
+                token_refresh: false,
+                codingplan: false,
+                daemon_handoff: true,
+                account_relay: false,
+            },
         })
         .into_response(),
     }
+}
+
+fn current_unix_secs() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
 }
 
 /// POST /auth/login/start - Starts OAuth login and returns URL + login_id.
@@ -197,8 +250,18 @@ pub(crate) async fn auth_logout() -> impl IntoResponse {
             Json(AuthStatusResponse {
                 logged_in: false,
                 auth_path: auth_path.to_string_lossy().to_string(),
+                provider: AUTH_PROVIDER.to_string(),
+                account_id: None,
+                username: None,
                 user: None,
                 token: None,
+                capabilities: AuthCapabilities {
+                    oauth_login: true,
+                    token_refresh: false,
+                    codingplan: false,
+                    daemon_handoff: true,
+                    account_relay: false,
+                },
             })
             .into_response()
         }

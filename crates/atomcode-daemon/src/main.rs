@@ -32,6 +32,7 @@ use atomcode_core::mcp::{register_mcp_tools, McpRegistry};
 use atomcode_core::provider;
 use atomcode_core::session::{Session, SessionId, SessionManager, SessionMeta};
 use atomcode_core::tool::diagnostics::DiagnosticsTool;
+use atomcode_core::tool::resolve_workspace_path;
 use atomcode_core::tool::{ToolContext, ToolRegistry};
 use atomcode_core::turn::event::{TurnEvent, TurnResult};
 use atomcode_core::turn::permission::{AutoPermissionDecider, AutoPermissionMode};
@@ -177,6 +178,89 @@ pub struct CreateSessionResponse {
     pub working_dir: PathBuf,
     pub project_hash: String,
     pub created_at: u64,
+}
+
+/// 手机接力请求。
+#[derive(Debug, Deserialize)]
+pub struct HandoffRequest {
+    pub source: String,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    pub task: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub working_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub mobile_session_id: Option<String>,
+    #[serde(default)]
+    pub return_url: Option<String>,
+    #[serde(default)]
+    pub diff_summary: Option<String>,
+    #[serde(default)]
+    pub comment_draft: Option<String>,
+    #[serde(default)]
+    pub recent_actions: Option<Vec<String>>,
+}
+
+/// 接力会话响应。
+#[derive(Debug, Serialize)]
+pub struct HandoffResponse {
+    pub session_id: String,
+    pub project_hash: String,
+    pub name: String,
+    pub working_dir: PathBuf,
+    pub message_count: usize,
+    pub account_id: Option<String>,
+    pub username: Option<String>,
+    pub relay_supported: bool,
+}
+
+/// 接力预览参数。
+#[derive(Debug, Deserialize)]
+pub struct HandoffPreviewQuery {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub record_id: Option<String>,
+    #[serde(default)]
+    pub return_url: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub pair: Option<String>,
+}
+
+/// 接力预览响应。
+#[derive(Debug, Serialize)]
+pub struct HandoffPreviewResponse {
+    pub ok: bool,
+    pub message: String,
+    pub source: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub task: Option<String>,
+    pub title: Option<String>,
+    pub record_id: Option<String>,
+    pub return_url: Option<String>,
+    pub account: Option<String>,
+    pub username: Option<String>,
+    pub pair: Option<String>,
+    pub logged_in: bool,
+    pub atomcode_username: Option<String>,
+    pub next: String,
 }
 
 /// Session detail response
@@ -1116,22 +1200,239 @@ async fn create_session(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(msg)).into_response();
     }
 
-    // Calculate project hash for response
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    working_dir.hash(&mut hasher);
-    let project_hash = format!("{:016x}", hasher.finish());
-
     let response = CreateSessionResponse {
         id: session.id.to_string(),
         name: session.name.clone(),
         working_dir: session.working_dir.clone(),
-        project_hash,
+        project_hash: manager.project_hash().to_string(),
         created_at: session.created_at,
     };
 
     (StatusCode::CREATED, Json(response)).into_response()
+}
+
+/// POST /handoff - Create an AtomCode session from mobile/client task context.
+async fn create_handoff_session(
+    State(state): State<AppState>,
+    Json(mut req): Json<HandoffRequest>,
+) -> impl IntoResponse {
+    if req.task.trim().is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "handoff task cannot be empty").into_response();
+    }
+    if let Err(msg) = validate_handoff_url(&req.return_url) {
+        return json_error(StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    req.return_url = normalize_optional_text(req.return_url);
+
+    let project_root = {
+        let project = state.project.read().await;
+        project.working_dir.clone()
+    };
+
+    let working_dir = match req.working_dir.clone() {
+        Some(dir) => {
+            let raw = dir.to_string_lossy().to_string();
+            match resolve_workspace_path(&raw, &project_root) {
+                Ok(path) => path,
+                Err(e) => {
+                    return json_error(StatusCode::BAD_REQUEST, format!("{:#}", e)).into_response()
+                }
+            }
+        }
+        None => project_root,
+    };
+
+    if !working_dir.exists() || !working_dir.is_dir() {
+        let msg = format!("Working directory is invalid: {:?}", working_dir);
+        return json_error(StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    let manager = SessionManager::new(&working_dir);
+    let mut session = Session::new(working_dir.clone());
+    session.rename(handoff_title(&req));
+    session
+        .messages
+        .push(atomcode_core::conversation::message::Message::new(
+            atomcode_core::conversation::message::Role::User,
+            handoff_prompt(&req),
+        ));
+    session.touch();
+
+    if let Err(e) = manager.save(&session) {
+        let msg = format!("Failed to save handoff session: {}", e);
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+    }
+
+    let auth_info = atomcode_core::auth::get_stored_auth();
+    let account_id = auth_info.as_ref().map(|a| a.user.id.clone());
+    let username = auth_info.as_ref().map(|a| a.user.username.clone());
+
+    let response = HandoffResponse {
+        session_id: session.id.to_string(),
+        project_hash: manager.project_hash().to_string(),
+        name: session.name.clone(),
+        working_dir: session.working_dir.clone(),
+        message_count: session.messages.len(),
+        account_id,
+        username,
+        relay_supported: false,
+    };
+
+    (StatusCode::CREATED, Json(response)).into_response()
+}
+
+/// GET /handoff - Preview a mobile/manual handoff link without creating a session.
+async fn preview_handoff(Query(mut query): Query<HandoffPreviewQuery>) -> impl IntoResponse {
+    if let Err(msg) = validate_handoff_url(&query.return_url) {
+        return json_error(StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    query.return_url = normalize_optional_text(query.return_url);
+
+    let auth_info = atomcode_core::auth::get_stored_auth();
+    let atomcode_username = auth_info.as_ref().map(|a| a.user.username.clone());
+    let has_task = query
+        .task
+        .as_ref()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let has_pair = query
+        .pair
+        .as_ref()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let message = if has_task {
+        "Handoff link received. POST the same task context to /handoff to create an AtomCode session."
+    } else if has_pair {
+        "Pairing link received. Use POST /handoff when a concrete task is ready."
+    } else {
+        "AtomCode handoff endpoint is available. Use POST /handoff to create a session."
+    };
+
+    Json(HandoffPreviewResponse {
+        ok: true,
+        message: message.to_string(),
+        source: query.source,
+        repo: query.repo,
+        branch: query.branch,
+        task: query.task,
+        title: query.title,
+        record_id: query.record_id,
+        return_url: query.return_url,
+        account: query.account,
+        username: query.username,
+        pair: query.pair,
+        logged_in: auth_info.is_some(),
+        atomcode_username,
+        next: "POST /handoff with JSON HandoffRequest to create a persisted session".to_string(),
+    })
+    .into_response()
+}
+
+fn handoff_title(req: &HandoffRequest) -> String {
+    if let Some(title) = req.title.as_ref().filter(|v| !v.trim().is_empty()) {
+        return title.trim().chars().take(80).collect();
+    }
+
+    let task = req.task.trim();
+    let short_task: String = task.chars().take(60).collect();
+    if short_task.is_empty() {
+        format!("mobile handoff: {}", req.source)
+    } else {
+        format!("{}: {}", req.source, short_task)
+    }
+}
+
+fn handoff_prompt(req: &HandoffRequest) -> String {
+    let mut lines = vec![
+        "Mobile handoff context from GitCode/GitCodeAlira.".to_string(),
+        String::new(),
+        format!("Source: {}", req.source),
+        format!("Task: {}", req.task.trim()),
+    ];
+
+    push_optional_line(&mut lines, "Repository", &req.repo);
+    push_optional_line(&mut lines, "Branch", &req.branch);
+    push_optional_line(&mut lines, "Mobile session", &req.mobile_session_id);
+    push_optional_line(&mut lines, "Return URL", &req.return_url);
+    push_optional_line(&mut lines, "Diff summary", &req.diff_summary);
+    push_optional_line(&mut lines, "Comment draft", &req.comment_draft);
+
+    if let Some(actions) = &req.recent_actions {
+        if !actions.is_empty() {
+            lines.push("Recent actions:".to_string());
+            for action in actions {
+                lines.push(format!("- {}", action));
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Please continue from this context, verify changes, and keep the return path visible for the mobile client.".to_string());
+    lines.join("\n")
+}
+
+fn push_optional_line(lines: &mut Vec<String>, label: &str, value: &Option<String>) {
+    if let Some(v) = value.as_ref().filter(|v| !v.trim().is_empty()) {
+        lines.push(format!("{}: {}", label, v.trim()));
+    }
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn validate_handoff_url(value: &Option<String>) -> Result<(), String> {
+    let Some(url) = value.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Err("Unsupported handoff return_url scheme".to_string());
+    };
+
+    let scheme = scheme.to_ascii_lowercase();
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err("Unsupported handoff return_url scheme".to_string());
+    }
+
+    if scheme == "atomgit" || scheme == "gitcode" {
+        if rest.contains('@') {
+            return Err("Unsupported handoff return_url scheme".to_string());
+        }
+        return Ok(());
+    }
+
+    if scheme != "https" && scheme != "http" {
+        return Err("Unsupported handoff return_url scheme".to_string());
+    }
+
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return Err("Unsupported handoff return_url scheme".to_string());
+    }
+
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        })
+        .unwrap_or(authority)
+        .to_ascii_lowercase();
+
+    match (scheme.as_str(), host.as_str()) {
+        ("https", "gitcode.com") => Ok(()),
+        ("https", "atomgit.com") => Ok(()),
+        ("http", "localhost") => Ok(()),
+        ("http", "127.0.0.1") => Ok(()),
+        _ => Err("Unsupported handoff return_url scheme".to_string()),
+    }
 }
 
 /// Search sessions by name across all projects
@@ -2309,6 +2610,9 @@ async fn main() {
         // Chat API
         .route("/chat", post(chat_stream))
         .route("/chat/stop", post(stop_chat))
+        // 手机接力接口
+        .route("/handoff", get(preview_handoff))
+        .route("/handoff", post(create_handoff_session))
         // MCP API
         .route("/mcp/status", get(mcp_status))
         .route("/mcp/reload", post(mcp_reload))
@@ -2343,6 +2647,7 @@ async fn main() {
         .route("/auth/logout", post(api_auth::auth_logout))
         // CodingPlan API (P0)
         .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
+        .route("/codingplan/status", get(api_codingplan::codingplan_status))
         .with_state(state)
         .layer(cors_layer());
 
@@ -2377,6 +2682,10 @@ async fn main() {
     println!("  GET    /sessions/search?q=<keyword>    - Search sessions by name");
     println!("  GET    /models                         - List available models");
     println!("  POST   /chat                           - Stream chat response (SSE)");
+    println!("  GET    /handoff                        - Preview mobile/client handoff link");
+    println!(
+        "  POST   /handoff                        - Create session from mobile/client handoff"
+    );
     println!("  GET    /config                         - Get sanitized config");
     println!("  POST   /config/reload                  - Reload config from disk");
     println!("  GET    /providers                      - List providers");
@@ -2391,6 +2700,7 @@ async fn main() {
     println!("  DELETE /auth/login/:login_id           - Cancel login session");
     println!("  POST   /auth/logout                    - Logout");
     println!("  POST   /codingplan/setup               - Run CodingPlan setup");
+    println!("  GET    /codingplan/status              - CodingPlan account/config status");
     println!("\nChange directory body:");
     println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
     println!("\nChat request body:");
@@ -2425,5 +2735,193 @@ mod tests {
         assert!(!origin_is_allowed("http://localhost.evil.example"));
         assert!(!origin_is_allowed("null"));
         assert!(!origin_is_allowed("file://local/index.html"));
+    }
+
+    fn test_app_state(working_dir: PathBuf) -> AppState {
+        AppState {
+            sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            project: Arc::new(RwLock::new(ProjectState {
+                working_dir: working_dir.clone(),
+                previous_dir: None,
+                recent_dirs: vec![],
+                name: "test-project".to_string(),
+            })),
+            chat_tasks: Arc::new(RwLock::new(HashMap::new())),
+            stopped_sessions: Arc::new(RwLock::new(HashSet::new())),
+            mcp_registry: Arc::new(RwLock::new(Arc::new(McpRegistry::new()))),
+            login_sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn response_status(response: axum::response::Response) -> StatusCode {
+        response.status()
+    }
+
+    fn sample_handoff_request() -> HandoffRequest {
+        HandoffRequest {
+            source: "pull_request".to_string(),
+            repo: Some("atomgit_atomcode/atomcode".to_string()),
+            branch: Some("feat/mobile-handoff".to_string()),
+            task: "Review the diff and prepare a reply for the failing check.".to_string(),
+            title: None,
+            working_dir: None,
+            mobile_session_id: Some("mobile-session-1".to_string()),
+            return_url: Some("atomgit://pulls/42".to_string()),
+            diff_summary: Some("api_auth.rs and main.rs changed".to_string()),
+            comment_draft: Some("Looks good, but please verify CodingPlan status.".to_string()),
+            recent_actions: Some(vec![
+                "Opened pull request #42".to_string(),
+                "Viewed daemon API diff".to_string(),
+            ]),
+        }
+    }
+
+    #[test]
+    fn handoff_title_uses_source_and_short_task_by_default() {
+        let req = sample_handoff_request();
+        let title = handoff_title(&req);
+        assert!(title.starts_with("pull_request: Review the diff"));
+        assert!(title.chars().count() <= "pull_request: ".chars().count() + 60);
+    }
+
+    #[test]
+    fn handoff_title_prefers_explicit_title() {
+        let mut req = sample_handoff_request();
+        req.title = Some("Continue PR review on desktop".to_string());
+        assert_eq!(handoff_title(&req), "Continue PR review on desktop");
+    }
+
+    #[test]
+    fn handoff_prompt_preserves_mobile_context() {
+        let req = sample_handoff_request();
+        let prompt = handoff_prompt(&req);
+
+        assert!(prompt.contains("Mobile handoff context from GitCode/GitCodeAlira."));
+        assert!(prompt.contains("Source: pull_request"));
+        assert!(prompt.contains("Repository: atomgit_atomcode/atomcode"));
+        assert!(prompt.contains("Branch: feat/mobile-handoff"));
+        assert!(prompt.contains("Mobile session: mobile-session-1"));
+        assert!(prompt.contains("Return URL: atomgit://pulls/42"));
+        assert!(prompt.contains("Diff summary: api_auth.rs and main.rs changed"));
+        assert!(prompt.contains("Comment draft: Looks good"));
+        assert!(prompt.contains("- Opened pull request #42"));
+        assert!(prompt.contains("verify changes"));
+    }
+
+    #[test]
+    fn handoff_url_allows_known_hosts_and_deep_links() {
+        for url in [
+            "https://gitcode.com",
+            "https://gitcode.com/",
+            "https://gitcode.com/XiaYuanOwO/atomcode",
+            "https://atomgit.com",
+            "https://atomgit.com/atomgit_atomcode/atomcode",
+            "https://gitcode.com:443/XiaYuanOwO/atomcode",
+            "https://atomgit.com:443/atomgit_atomcode/atomcode",
+            "http://localhost:13456/handoff",
+            "http://127.0.0.1:13456/handoff",
+            "atomgit://pulls/42",
+            "gitcode://repo/XiaYuanOwO/atomcode",
+        ] {
+            assert!(
+                validate_handoff_url(&Some(url.to_string())).is_ok(),
+                "expected allowed url: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn handoff_url_rejects_prefix_bypass_hosts() {
+        for url in [
+            "https://gitcode.com.evil.example",
+            "https://atomgit.com.evil.example",
+            "https://gitcode.com@evil.example",
+            "https://atomgit.com@evil.example",
+            "https://gitcode.com:bad/path",
+            "https://gitcode.com.evil.example:443/path",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "https://evil.example/gitcode.com",
+        ] {
+            assert!(
+                validate_handoff_url(&Some(url.to_string())).is_err(),
+                "expected rejected url: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_handoff_rejects_unsafe_return_url() {
+        let response = preview_handoff(Query(HandoffPreviewQuery {
+            source: Some("mobile".to_string()),
+            repo: None,
+            branch: None,
+            task: Some("Continue review".to_string()),
+            title: None,
+            record_id: None,
+            return_url: Some("https://gitcode.com.evil.example/path".to_string()),
+            account: None,
+            username: None,
+            pair: None,
+        }))
+        .await
+        .into_response();
+
+        assert_eq!(response_status(response), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_handoff_session_persists_mobile_context() {
+        let previous_home = std::env::var_os("ATOMCODE_HOME");
+        let temp_home = tempfile::tempdir().unwrap();
+        let project_dir = temp_home.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::env::set_var("ATOMCODE_HOME", temp_home.path());
+        assert_eq!(Config::config_dir(), temp_home.path());
+
+        let state = test_app_state(project_dir.clone());
+        let mut req = sample_handoff_request();
+        req.working_dir = None;
+
+        let response = create_handoff_session(State(state), Json(req))
+            .await
+            .into_response();
+        assert_eq!(response_status(response), StatusCode::CREATED);
+
+        let manager = SessionManager::new(&project_dir);
+        let sessions = manager.list().unwrap();
+        if let Some(value) = previous_home {
+            std::env::set_var("ATOMCODE_HOME", value);
+        } else {
+            std::env::remove_var("ATOMCODE_HOME");
+        }
+        assert_eq!(sessions.len(), 1);
+
+        let session = manager.load(&sessions[0].id).unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert!(session.name.starts_with("pull_request: Review the diff"));
+        let content = format!("{:?}", session.messages[0]);
+        assert!(content.contains("Mobile handoff context from GitCode/GitCodeAlira."));
+        assert!(content.contains("Repository: atomgit_atomcode/atomcode"));
+        assert!(content.contains("Return URL: atomgit://pulls/42"));
+    }
+
+    #[tokio::test]
+    async fn create_handoff_session_rejects_path_outside_project() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let project_dir = temp_home.path().join("project");
+        let outside_dir = temp_home.path().join("outside");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::env::set_var("ATOMCODE_HOME", temp_home.path());
+
+        let state = test_app_state(project_dir);
+        let mut req = sample_handoff_request();
+        req.working_dir = Some(outside_dir);
+
+        let response = create_handoff_session(State(state), Json(req))
+            .await
+            .into_response();
+        assert_eq!(response_status(response), StatusCode::BAD_REQUEST);
     }
 }

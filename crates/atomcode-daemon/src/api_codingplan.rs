@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use atomcode_core::auth;
 use atomcode_core::coding_plan;
+use atomcode_core::coding_plan::Client;
 
 use crate::{
     api_auth::{poll_login_session, LoginPollStep},
@@ -40,6 +41,19 @@ struct SetupSteps {
 struct StepInfo {
     status: String,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CodingPlanStatusResponse {
+    logged_in: bool,
+    username: Option<String>,
+    configured: bool,
+    default_provider: String,
+    providers: Vec<crate::ProviderInfo>,
+    last_sync_unix_secs: Option<u64>,
+    remote_status: StepInfo,
+    models: StepInfo,
+    needs_setup: bool,
 }
 
 // ============================================================================
@@ -150,6 +164,108 @@ pub(crate) async fn codingplan_setup(
         default_provider: config_resp.default_provider,
         providers: config_resp.providers,
         steps,
+    })
+    .into_response()
+}
+
+/// GET /codingplan/status - CodingPlan 状态。
+pub(crate) async fn codingplan_status() -> impl IntoResponse {
+    let auth_info = auth::get_stored_auth();
+    let logged_in = auth_info.is_some();
+    let username = auth_info.as_ref().map(|a| a.user.username.clone());
+
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let config_resp = config_response(&config);
+    let codingplan_providers: Vec<crate::ProviderInfo> = config_resp
+        .providers
+        .into_iter()
+        .filter(|p| p.name == "AtomGit" || p.name.starts_with("AtomGit-"))
+        .collect();
+    let configured = !codingplan_providers.is_empty();
+
+    let last_sync_unix_secs = coding_plan::read_last_sync()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    let mut remote_status = StepInfo {
+        status: "skipped".to_string(),
+        message: "not logged in".to_string(),
+    };
+    let mut models = StepInfo {
+        status: "skipped".to_string(),
+        message: "not logged in".to_string(),
+    };
+
+    if logged_in {
+        let remote_result = tokio::task::spawn_blocking(move || {
+            let client = Client::from_stored_auth()?;
+            let status = client.status();
+            let model_count = client.list_models().map(|m| m.len());
+            Ok::<_, anyhow::Error>((status, model_count))
+        })
+        .await;
+
+        match remote_result {
+            Ok(Ok((status_result, model_count_result))) => {
+                remote_status = match status_result {
+                    Ok(status) => StepInfo {
+                        status: "ok".to_string(),
+                        message: format!("{:?}", status),
+                    },
+                    Err(e) => StepInfo {
+                        status: "error".to_string(),
+                        message: format!("{:#}", e),
+                    },
+                };
+                models = match model_count_result {
+                    Ok(count) => StepInfo {
+                        status: "ok".to_string(),
+                        message: format!("{} model(s)", count),
+                    },
+                    Err(e) => StepInfo {
+                        status: "error".to_string(),
+                        message: format!("{:#}", e),
+                    },
+                };
+            }
+            Ok(Err(e)) => {
+                remote_status = StepInfo {
+                    status: "error".to_string(),
+                    message: format!("{:#}", e),
+                };
+                models = StepInfo {
+                    status: "error".to_string(),
+                    message: "unable to build CodingPlan client".to_string(),
+                };
+            }
+            Err(e) => {
+                remote_status = StepInfo {
+                    status: "error".to_string(),
+                    message: format!("status task failed: {:#}", e),
+                };
+                models = StepInfo {
+                    status: "error".to_string(),
+                    message: "status task failed".to_string(),
+                };
+            }
+        }
+    }
+
+    let needs_setup = !logged_in || !configured || models.status != "ok";
+    Json(CodingPlanStatusResponse {
+        logged_in,
+        username,
+        configured,
+        default_provider: config_resp.default_provider,
+        providers: codingplan_providers,
+        last_sync_unix_secs,
+        remote_status,
+        models,
+        needs_setup,
     })
     .into_response()
 }
