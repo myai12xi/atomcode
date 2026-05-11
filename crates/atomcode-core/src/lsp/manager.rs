@@ -126,12 +126,8 @@ impl LspManager {
                 clients.insert(ext, arc);
                 Ok(true)
             }
-            Err(e) => {
-                // Log but don't propagate — LSP is best-effort.
-                eprintln!(
-                    "[lsp] Failed to start {} for .{}: {}",
-                    config.command, ext, e
-                );
+            Err(_e) => {
+                // Avoid eprintln! to prevent corrupting TUI raw mode display.
                 Ok(false)
             }
         }

@@ -66,18 +66,29 @@ impl Tool for DiagnosticsTool {
         };
 
         let severity_filter = parsed.severity.as_deref().unwrap_or("error");
+        let mut lsp_server_failed = false;
 
         // If a file path is given, sync the current file contents before reading
         // the diagnostics cache. LSP diagnostics are notification-driven.
         if let Some(ref fp) = parsed.file_path {
             let path = std::path::Path::new(fp);
             if let Ok(content) = tokio::fs::read_to_string(path).await {
-                if lsp.notify_file_changed(path, &content).await? {
-                    let delay = lsp.diagnostics_settle_delay_ms();
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                match lsp.notify_file_changed(path, &content).await {
+                    Ok(true) => {
+                        let delay = lsp.diagnostics_settle_delay_ms();
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                    Ok(false) | Err(_) => {
+                        lsp_server_failed = true;
+                    }
                 }
             } else {
-                let _ = lsp.ensure_server(path).await;
+                match lsp.ensure_server(path).await {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        lsp_server_failed = true;
+                    }
+                }
             }
         }
 
@@ -118,12 +129,18 @@ impl Tool for DiagnosticsTool {
             } else {
                 String::new()
             };
+            let mut output = format!(
+                "No diagnostics found{} (filter: {}).",
+                scope, severity_filter
+            );
+            if lsp_server_failed {
+                output.push_str("
+
+(LSP server not running — diagnostics may be empty.)");
+            }
             return Ok(ToolResult {
                 call_id: String::new(),
-                output: format!(
-                    "No diagnostics found{} (filter: {}).",
-                    scope, severity_filter
-                ),
+                output,
                 success: true,
             });
         }
