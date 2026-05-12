@@ -380,6 +380,7 @@ pub enum Msg<'a> {
     CmdDescWorktree,
     CmdDescUpgrade,
     CmdDescIssue,
+    CmdDescPr,
     CmdDescPlan,
     CmdDescBuild,
     CmdDescThink,

@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::auth;
 
-use super::models::{Comment, CreatedIssue, Issue, RepoLabel};
-use super::url::IssueRef;
+use super::models::{Comment, CreatedIssue, Issue, PrFile, PullRequest, RepoLabel};
+use super::url::{IssueRef, PrRef};
 
 const API_BASE: &str = "https://atomgit.com/api/v5";
 
@@ -259,5 +259,68 @@ impl Client {
             return Vec::new();
         }
         resp.json::<Vec<Comment>>().unwrap_or_default()
+    }
+
+    /// GET /api/v5/repos/{owner}/{repo}/pulls/{number}
+    pub fn get_pull_request(&self, r: &PrRef) -> Result<PullRequest> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}",
+            API_BASE, r.owner, r.repo, r.number
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/json")
+            .send()
+            .with_context(|| format!("GET {} failed", url))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(anyhow!(
+                "pull request not found: {}/{}/pulls/{}",
+                r.owner,
+                r.repo,
+                r.number
+            ));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(anyhow!(
+                "authentication failed ({}) — run `atomcode login` again",
+                status.as_u16()
+            ));
+        }
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "AtomGit API returned {} for PR #{}: {}",
+                status,
+                r.number,
+                body
+            ));
+        }
+        resp.json::<PullRequest>().context("failed to parse PR JSON")
+    }
+
+    /// GET /api/v5/repos/{owner}/{repo}/pulls/{number}/files.
+    /// Best-effort, swallowed on error — files are helpful but not critical.
+    pub fn get_pull_request_files(&self, r: &PrRef) -> Vec<PrFile> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/files",
+            API_BASE, r.owner, r.repo, r.number
+        );
+        let Ok(resp) = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "application/json")
+            .send()
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        resp.json::<Vec<PrFile>>().unwrap_or_default()
     }
 }

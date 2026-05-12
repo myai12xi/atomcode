@@ -117,6 +117,46 @@ pub struct CreatedIssue {
     pub html_url: Option<String>,
 }
 
+/// Shape returned by `GET /repos/{owner}/{repo}/pulls/{number}`.
+#[derive(Debug, Deserialize)]
+pub struct PullRequest {
+    #[serde(deserialize_with = "deserialize_u64_from_string_or_int")]
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub state: String,
+    #[serde(default)]
+    pub html_url: Option<String>,
+    #[serde(default)]
+    pub user: Option<User>,
+    /// Base branch label (e.g. "main").
+    #[serde(default)]
+    pub base_label: Option<String>,
+    /// Head branch label (e.g. "feature-branch").
+    #[serde(default)]
+    pub head_label: Option<String>,
+}
+
+/// Shape returned by `GET /repos/{owner}/{repo}/pulls/{number}/files`.
+#[derive(Debug, Deserialize)]
+pub struct PrFile {
+    pub filename: String,
+    /// One of "added", "removed", "modified", "renamed".
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    /// API URL to fetch the file contents.
+    #[serde(default)]
+    pub contents_url: Option<String>,
+    /// Raw diff/patch content.
+    #[serde(default)]
+    pub patch: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
