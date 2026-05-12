@@ -4,11 +4,12 @@
 
 pub mod client;
 pub mod fixissue;
+pub mod get_pr;
 pub mod models;
 pub mod url;
 
 pub use client::Client;
-pub use url::IssueRef;
+pub use url::{IssueRef, PrRef};
 
 /// Owner of the atomcode upstream repo on atomgit.com. Used by `/issue`
 /// to file bug reports / feature requests against atomcode **itself** —

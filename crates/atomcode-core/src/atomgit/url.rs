@@ -215,6 +215,82 @@ impl IssueRef {
     }
 }
 
+/// Reference to a specific Pull Request on atomgit.com.
+/// Created by parsing a URL like `https://atomgit.com/{owner}/{repo}/pulls/{number}`.
+pub struct PrRef {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+}
+
+impl PrRef {
+    /// Parse `https://atomgit.com/{owner}/{repo}/pulls/{number}`.
+    /// Trailing slash and `?query`/`#fragment` are tolerated.
+    pub fn parse(url: &str) -> Result<Self> {
+        let trimmed = url.trim();
+        let without_scheme = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+            .ok_or_else(|| anyhow!("PR URL must start with http(s)://"))?;
+
+        // Drop query + fragment before splitting path segments.
+        let path_only = without_scheme
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(without_scheme);
+
+        let mut parts = path_only.split('/').filter(|s| !s.is_empty());
+        let host = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing host in PR URL"))?;
+        if !host.eq_ignore_ascii_case("atomgit.com") {
+            return Err(anyhow!(
+                "only atomgit.com PR URLs are supported (got host {})",
+                host
+            ));
+        }
+
+        let owner = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing owner in PR URL"))?
+            .to_string();
+        let repo = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing repo in PR URL"))?
+            .to_string();
+        let pulls_seg = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing 'pulls' segment in URL"))?;
+        if pulls_seg != "pulls" {
+            return Err(anyhow!(
+                "expected '/pulls/' in URL, got '/{}/'",
+                pulls_seg
+            ));
+        }
+        let number_str = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing PR number in URL"))?;
+        let number = number_str
+            .parse::<u64>()
+            .map_err(|_| anyhow!("PR number '{}' is not a positive integer", number_str))?;
+
+        Ok(Self {
+            owner,
+            repo,
+            number,
+        })
+    }
+}
+
+impl From<&PrRef> for RepoRef {
+    fn from(r: &PrRef) -> Self {
+        Self {
+            owner: r.owner.clone(),
+            repo: r.repo.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

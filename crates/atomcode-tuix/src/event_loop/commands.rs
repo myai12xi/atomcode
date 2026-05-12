@@ -674,6 +674,25 @@ pub(super) fn execute_slash_command(
             wiz.emit_prompt(renderer);
             *active_modal = Some(Box::new(wiz));
         }
+        "pr" => {
+            let url = arg.trim();
+            if url.is_empty() {
+                renderer.render(UiLine::CommandOutput(
+                    "Usage: /pr https://atomgit.com/owner/repo/pulls/123".into(),
+                ));
+                renderer.flush();
+                return Ok(());
+            }
+            match atomcode_core::atomgit::get_pr::get_pr(url, &ctx.working_dir) {
+                Ok(report) => {
+                    renderer.render(UiLine::CommandOutput(report));
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("{:#}", e)));
+                }
+            }
+            renderer.flush();
+        }
         "cd" => {
             // Bare `/cd` — open the interactive history picker (matches legacy
             // TUI behaviour). The picker's Enter-handler invokes `apply_cd`

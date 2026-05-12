@@ -591,6 +591,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescWorktree => "Git 工作树隔离（create/list/done/cleanup）".into(),
         Msg::CmdDescUpgrade => "升级到最新版本（子命令：rollback）".into(),
         Msg::CmdDescIssue => "为 AtomCode 报告 Bug / 提出功能建议（交互式向导）".into(),
+        Msg::CmdDescPr => "查看 AtomGit 拉取请求（PR）详情和变更代码".into(),
         Msg::CmdDescPlan => "切换到 Plan 模式（只读探索）".into(),
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),

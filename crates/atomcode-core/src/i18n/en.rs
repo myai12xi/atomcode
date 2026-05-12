@@ -593,6 +593,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
         Msg::CmdDescUpgrade => "Upgrade atomcode to latest (subcommand: rollback)".into(),
         Msg::CmdDescIssue => "Report a bug / request a feature for AtomCode itself (interactive wizard)".into(),
+        Msg::CmdDescPr => "View pull request details and changed code from AtomGit".into(),
         Msg::CmdDescPlan => "Switch to Plan mode (read-only exploration)".into(),
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
